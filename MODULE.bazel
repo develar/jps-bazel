@@ -1,0 +1,19 @@
+module(
+    name = "bazel_worker_jps",
+    version = "0",
+)
+
+bazel_dep(name = "bazel_worker_api", version = "0.0.2")
+bazel_dep(name = "rules_jvm_external", version = "6.5")
+bazel_dep(name = "rules_java", version = "8.3.0")
+bazel_dep(name = "protobuf", version = "28.3")
+
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+  artifacts = [
+    "com.google.protobuf:protobuf-java:4.28.3",
+    "com.google.protobuf:protobuf-java-util:4.28.3",
+  ],
+)
+
+use_repo(maven, "maven")

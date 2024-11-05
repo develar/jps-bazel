@@ -1,0 +1,6 @@
+.idea/
+.bazelbsp
+bazel-bin
+bazel-jps-bazel
+bazel-out
+bazel-testlogs
