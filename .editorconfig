@@ -17,3 +17,6 @@ ij_javascript_force_semicolon_style = true
 ij_javascript_use_semicolon_after_statement = false
 ij_any_align_multiline_parameters_in_calls = true
 ij_kotlin_code_style_defaults = KOTLIN_OLD_DEFAULTS
+
+[*.bzl]
+indent_size = 4
