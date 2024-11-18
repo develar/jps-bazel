@@ -25,6 +25,7 @@ import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.StringWriter
+import java.io.Writer
 import java.lang.AutoCloseable
 import java.lang.Error
 import java.lang.Exception
@@ -44,7 +45,7 @@ class WorkRequestHandler internal constructor(
   /**
    * This worker's stderr.
    */
-  private val stderr: PrintStream,
+  private val errorStream: PrintStream,
   private val messageProcessor: WorkerMessageProcessor,
   private val cancelCallback: ((Int, Thread) -> Unit)?,
 ) : AutoCloseable {
@@ -55,19 +56,18 @@ class WorkRequestHandler internal constructor(
   internal val activeRequests: ConcurrentHashMap<Int, RequestInfo> = ConcurrentHashMap<Int, RequestInfo>()
 
   /**
-   * If set, this worker will stop handling requests and shut itself down. This can happen if
-   * something throws an [Error].
+   * If set, this worker will stop handling requests and shut itself down. This can happen if something throws an [Error].
    */
   private val shutdownWorker = AtomicBoolean(false)
 
   //TestOnly
   internal constructor(
-    callback: WorkRequestCallback,
-    stderr: PrintStream,
+    executor: WorkRequestCallback,
+    errorStream: PrintStream,
     messageProcessor: WorkerMessageProcessor
   ) : this(
-    callback = callback,
-    stderr = stderr,
+    callback = executor,
+    errorStream = errorStream,
     messageProcessor = messageProcessor,
     cancelCallback = null,
   )
@@ -98,9 +98,9 @@ class WorkRequestHandler internal constructor(
         }
       }
     }
-    catch (e: IOException) {
-      stderr.println("Error reading next WorkRequest: $e")
-      e.printStackTrace(stderr)
+    catch (e: Throwable) {
+      errorStream.println("Error reading next WorkRequest: $e")
+      e.printStackTrace(errorStream)
     }
     finally {
       // TODO(b/220878242): Give the outstanding requests a chance to send a "shutdown" response,
@@ -108,13 +108,13 @@ class WorkRequestHandler internal constructor(
       // We considered doing System.exit here, but that is hard to test and would deny the callers
       // of this method a chance to clean up. Instead, we initiate the cleanup of our resources here
       // and the caller can decide whether to wait for an orderly shutdown or now.
-      for (ri in activeRequests.values) {
-        if (ri.thread.isAlive) {
+      for (activeRequest in activeRequests.values) {
+        if (activeRequest.thread.isAlive) {
           try {
-            ri.thread.interrupt()
+            activeRequest.thread.interrupt()
           }
           catch (_: RuntimeException) {
-            // If we can't interrupt, we can't do much else.
+            // if we can't interrupt, we can't do much else
           }
         }
       }
@@ -124,7 +124,7 @@ class WorkRequestHandler internal constructor(
         workerIo.close()
       }
       catch (e: Exception) {
-        stderr.println(e.message)
+        errorStream.println(e.message)
       }
     }
   }
@@ -132,9 +132,9 @@ class WorkRequestHandler internal constructor(
   /**
    * Starts a thread for the given request.
    */
-  fun startResponseThread(workerIO: WorkerIo, request: WorkRequest) {
+  private fun startResponseThread(workerIO: WorkerIo, request: WorkRequest) {
     val currentThread = Thread.currentThread()
-    val threadName = if (request.requestId > 0) "multiplex-request-" + request.requestId else "singleplex-request"
+    val threadName = if (request.requestId > 0) "multiplex-request-${request.requestId}" else "singleplex-request"
     if (request.requestId == 0) {
       while (activeRequests.containsKey(request.requestId)) {
         // Previous singleplex requests can still be in activeRequests for a bit after the response has been sent.
@@ -151,18 +151,15 @@ class WorkRequestHandler internal constructor(
 
     val t = Thread(
       Runnable {
-        val requestInfo = activeRequests.get(request.requestId)
-        if (requestInfo == null) {
-          return@Runnable
-        }
+        val requestInfo = activeRequests.get(request.requestId) ?: return@Runnable
         try {
           respondToRequest(workerIo = workerIO, request = request, requestInfo = requestInfo)
         }
         catch (e: IOException) {
           // IOExceptions here means a problem talking to the server, so we must shut down.
           if (!shutdownWorker.compareAndSet(false, true)) {
-            stderr.println("Error communicating with server, shutting down worker.")
-            e.printStackTrace(stderr)
+            errorStream.println("Error communicating with server, shutting down worker.")
+            e.printStackTrace(errorStream)
             currentThread.interrupt()
           }
         }
@@ -177,8 +174,8 @@ class WorkRequestHandler internal constructor(
         // Shut down the worker in case of severe issues. We don't handle RuntimeException here,
         // as those are not serious enough to merit shutting down the worker.
         if (e is Error && shutdownWorker.compareAndSet(false, true)) {
-          stderr.println("Error thrown by worker thread, shutting down worker.")
-          e.printStackTrace(stderr)
+          errorStream.println("Error thrown by worker thread, shutting down worker.")
+          e.printStackTrace(errorStream)
           currentThread.interrupt()
           exitProcess(1)
         }
@@ -198,38 +195,39 @@ class WorkRequestHandler internal constructor(
   internal fun respondToRequest(workerIo: WorkerIo, request: WorkRequest, requestInfo: RequestInfo) {
     var exitCode: Int
     val stringWriter = StringWriter()
-    PrintWriter(stringWriter).use { pw ->
+    stringWriter.use { writer ->
       try {
-        exitCode = callback.execute(request, pw)
+        exitCode = callback.execute(request, writer)
       }
       catch (_: InterruptedException) {
         exitCode = 1
       }
-      catch (e: RuntimeException) {
-        e.printStackTrace(pw)
+      catch (e: Throwable) {
+        PrintWriter(writer).use { e.printStackTrace(it) }
         exitCode = 1
       }
+
       try {
         // read out the captured string for the final WorkResponse output
         val captured = workerIo.readCapturedAsUtf8String().trim()
         if (!captured.isEmpty()) {
-          pw.write(captured)
+          writer.write(captured)
         }
       }
-      catch (e: IOException) {
-        stderr.println(e.message)
+      catch (e: Throwable) {
+        errorStream.println(e.message)
       }
     }
 
-    val builder = requestInfo.takeBuilder() ?: return
-    builder.setRequestId(request.requestId)
+    val responseBuilder = requestInfo.takeBuilder() ?: return
+    responseBuilder.setRequestId(request.requestId)
     if (requestInfo.isCancelled()) {
-      builder.setWasCancelled(true)
+      responseBuilder.setWasCancelled(true)
     }
     else {
-      builder.setOutput(builder.getOutput() + stringWriter).setExitCode(exitCode)
+      responseBuilder.setOutput(responseBuilder.getOutput() + stringWriter).setExitCode(exitCode)
     }
-    val response = builder.build()
+    val response = responseBuilder.build()
     synchronized(this) {
       messageProcessor.writeWorkResponse(response)
     }
@@ -354,11 +352,11 @@ class WorkRequestCallback(
    * The first argument to `callback` is the WorkRequest, the second is where all error messages and other user-oriented
    * messages should be written to. The callback must return an exit code indicating success (zero) or failure (nonzero).
    */
-  private val callback: (WorkRequest, PrintWriter) -> Int
+  private val executor: (WorkRequest, Writer) -> Int
 ) {
   @Throws(InterruptedException::class)
-  fun execute(workRequest: WorkRequest, printWriter: PrintWriter): Int {
-    val result = callback(workRequest, printWriter)
+  fun execute(workRequest: WorkRequest, writer: Writer): Int {
+    val result = executor(workRequest, writer)
     if (Thread.interrupted()) {
       throw InterruptedException("Work request interrupted: ${workRequest.requestId}")
     }
@@ -373,16 +371,16 @@ class WorkRequestHandlerBuilder
 /**
  * Creates a `WorkRequestHandlerBuilder`.
  *
- * @param callback         WorkRequestCallback object with Callback method for executing a single
+ * @param executor         WorkRequestCallback object with Callback method for executing a single
  * WorkRequest in a thread. The first argument to `callback` is the WorkRequest, the
  * second is where all error messages and other user-oriented messages should be written to.
  * The callback must return an exit code indicating success (zero) or failure (nonzero).
- * @param stderr           Stream that log messages should be written to, typically the process' stderr.
+ * @param errorStream           Stream that log messages should be written to, typically the process' stderr.
  * @param messageProcessor Object responsible for parsing `WorkRequest`s from the server
  * and writing `WorkResponses` to the server.
  */(
-  private val callback: WorkRequestCallback,
-  private val stderr: PrintStream,
+  private val executor: WorkRequestCallback,
+  private val errorStream: PrintStream,
   private val messageProcessor: WorkerMessageProcessor,
 ) {
   private var cancelCallback: ((Int, Thread) -> Unit)? = null
@@ -401,8 +399,8 @@ class WorkRequestHandlerBuilder
    */
   fun build(): WorkRequestHandler {
     return WorkRequestHandler(
-      callback = callback,
-      stderr = stderr,
+      executor = executor,
+      errorStream = errorStream,
       messageProcessor = messageProcessor,
     )
   }
@@ -421,7 +419,7 @@ class WorkRequestHandlerBuilder
  * WorkerIO implements [AutoCloseable] and will swap the original streams back into
  * [System] once close has been called.
  */
-class WorkerIo
+internal class WorkerIo
 /**
  * Creates a new [WorkerIo] that allows [WorkRequestHandler] to capture standard
  * output and error streams that can't be directly captured by the PrintStream associated with
@@ -430,15 +428,15 @@ class WorkerIo
   /**
    * Returns the original input stream most commonly provided by [System.in]
    */
-  val originalInputStream: InputStream?,
+  @JvmField val originalInputStream: InputStream?,
   /**
    * Returns the original output stream most commonly provided by [System.out]
    */
-  val originalOutputStream: PrintStream?,
+  @JvmField val originalOutputStream: PrintStream?,
   /**
    * Returns the original error stream most commonly provided by [System.err]
    */
-  val originalErrorStream: PrintStream?,
+  @JvmField val originalErrorStream: PrintStream?,
   private val capturedStream: ByteArrayOutputStream,
   private val restore: AutoCloseable
 ) : AutoCloseable {
@@ -460,7 +458,7 @@ class WorkerIo
 /**
  * Wraps the standard System streams and WorkerIO instance
  */
-fun wrapStandardSystemStreams(): WorkerIo {
+internal fun wrapStandardSystemStreams(): WorkerIo {
   // Save the original streams
   val originalInputStream = System.`in`
   val originalOutputStream = System.out
