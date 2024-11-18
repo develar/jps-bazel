@@ -1,6 +1,6 @@
 # https://bazel.build/docs/bazel-and-java#hermetic-testing
 # The code is compiled for, executed, and tested on this JVM.
-build --java_language_version=17
+build --java_language_version=21
 build --java_runtime_version=remotejdk_21
 
 # https://bazel.build/docs/bazel-and-java#config-build-tools-java
@@ -15,3 +15,4 @@ common --experimental_ui_max_stdouterr_bytes=-1
 
 # disable deprecated WORKSPACE support
 # common --noenable_workspace
+test --test_verbose_timeout_warnings --test_timeout=60 --test_output=all

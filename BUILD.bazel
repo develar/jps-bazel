@@ -1,18 +1,52 @@
-package(default_visibility = ["//visibility:public"])
-
+load("@contrib_rules_jvm//docs:stardoc-input.bzl", "java_junit5_test")
 load("@rules_java//java:java_library.bzl", "java_library")
+load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary", "kt_jvm_import", "kt_jvm_library")
 
 java_proto_library(
-  name = "worker_protocol_java_proto",
-  deps = ["@bazel_worker_api//:worker_protocol_proto"],
+    name = "worker_protocol_java_proto",
+    deps = ["@bazel_worker_api//:worker_protocol_proto"],
 )
 
-java_library(
-  name = "work_request_handlers",
-  srcs = glob(["src/**/*.kt", "src/**/*.java"]),
-  deps = [
-    "//:worker_protocol_java_proto",
-    "@maven//:com_google_protobuf_protobuf_java",
-    "@maven//:com_google_protobuf_protobuf_java_util",
-  ],
+kt_jvm_import(
+    name = "protobuf-java",
+    jar = "@protobuf-java-file//file",
+)
+
+kt_jvm_import(
+    name = "protobuf-java-util",
+    jar = "@protobuf-java-util-file//file",
+)
+
+kt_jvm_binary(
+    name = "worker",
+    srcs = glob(["src/*.kt"]),
+    main_class = "org.jetbrains.jps.bazel.JpsBazelBuilder",
+    deps = [
+        "//:worker_protocol_java_proto",
+        ":protobuf-java",
+        ":protobuf-java-util",
+    ],
+)
+
+kt_jvm_library(
+    name = "worker_test_lib",
+    srcs = ["testSrc/WorkRequestHandlerTest.kt"],
+    associates = [":worker"],
+    deps = [
+        "//:worker_protocol_java_proto",
+        "@junit_jupiter_api//jar",
+        "@junit_jupiter_engine//jar",
+        "@junit_platform_engine//jar",
+        "@junit_platform_reporting//jar",
+        "@junit_platform_launcher//jar",
+        "@junit_platform_commons//jar",
+        "@opentest4j//jar",
+        "@assertj//jar",
+    ],
+)
+
+java_junit5_test(
+    name = "worker_test",
+    test_class = "org.jetbrains.bazel.jvm.WorkRequestHandlerTest",
+    runtime_deps = [":worker_test_lib"],
 )
