@@ -16,20 +16,12 @@
 package org.jetbrains.bazel.jvm
 
 import java.io.PrintStream
-import java.util.function.BiConsumer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.function.BiFunction
 import java.io.PrintWriter
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest
 import java.io.IOException
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse
-import com.sun.management.OperatingSystemMXBean
-import java.util.concurrent.ScheduledThreadPoolExecutor
-import java.time.Instant
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.StringWriter
@@ -37,9 +29,7 @@ import java.lang.AutoCloseable
 import java.lang.Error
 import java.lang.Exception
 import java.lang.RuntimeException
-import java.lang.management.ManagementFactory
 import java.nio.charset.StandardCharsets
-import java.time.Duration
 import kotlin.system.exitProcess
 
 /**
@@ -55,30 +45,14 @@ class WorkRequestHandler internal constructor(
    * This worker's stderr.
    */
   private val stderr: PrintStream,
-  val messageProcessor: WorkerMessageProcessor,
-  cpuUsageBeforeGc: Duration,
-  private val cancelCallback: BiConsumer<Int, Thread>?,
-  idleTimeBeforeGc: Duration,
+  private val messageProcessor: WorkerMessageProcessor,
+  private val cancelCallback: ((Int, Thread) -> Unit)?,
 ) : AutoCloseable {
   /**
    * Requests that are currently being processed. Visible for testing.
    */
   // visible for test
   internal val activeRequests: ConcurrentHashMap<Int, RequestInfo> = ConcurrentHashMap<Int, RequestInfo>()
-
-  /**
-   * A scheduler that runs garbage collection after a certain amount of CPU time has passed. In our
-   * experience, explicit GC reclaims much more than implicit GC. This scheduler helps make sure
-   * very busy workers don't grow ridiculously large.
-   */
-  private val gcScheduler = CpuTimeBasedGcScheduler(cpuUsageBeforeGc)
-
-  /**
-   * A scheduler that runs garbage collection after a certain amount of time without any activity.
-   * In our experience, explicit GC reclaims much more than implicit GC. This scheduler helps make
-   * sure workers don't hang on to excessive memory after they are done working.
-   */
-  private val idleGcScheduler = IdleGcScheduler(idleTimeBeforeGc)
 
   /**
    * If set, this worker will stop handling requests and shut itself down. This can happen if
@@ -95,9 +69,7 @@ class WorkRequestHandler internal constructor(
     callback = callback,
     stderr = stderr,
     messageProcessor = messageProcessor,
-    cpuUsageBeforeGc = Duration.ZERO,
     cancelCallback = null,
-    idleTimeBeforeGc = Duration.ZERO,
   )
 
   /**
@@ -117,11 +89,7 @@ class WorkRequestHandler internal constructor(
     val workerIo = wrapStandardSystemStreams()
     try {
       while (!shutdownWorker.get()) {
-        val request = messageProcessor.readWorkRequest()
-        idleGcScheduler.markActivity(true)
-        if (request == null) {
-          break
-        }
+        val request = messageProcessor.readWorkRequest() ?: break
         if (request.cancel) {
           respondToCancelRequest(request)
         }
@@ -135,7 +103,6 @@ class WorkRequestHandler internal constructor(
       e.printStackTrace(stderr)
     }
     finally {
-      idleGcScheduler.stop()
       // TODO(b/220878242): Give the outstanding requests a chance to send a "shutdown" response,
       // but also try to kill stuck threads. For now, we just interrupt the remaining threads.
       // We considered doing System.exit here, but that is hard to test and would deny the callers
@@ -186,8 +153,6 @@ class WorkRequestHandler internal constructor(
       Runnable {
         val requestInfo = activeRequests.get(request.requestId)
         if (requestInfo == null) {
-          // already canceled
-          idleGcScheduler.markActivity(!activeRequests.isEmpty())
           return@Runnable
         }
         try {
@@ -203,7 +168,6 @@ class WorkRequestHandler internal constructor(
         }
         finally {
           activeRequests.remove(request.requestId)
-          idleGcScheduler.markActivity(!activeRequests.isEmpty())
         }
       },
       threadName
@@ -216,7 +180,6 @@ class WorkRequestHandler internal constructor(
           stderr.println("Error thrown by worker thread, shutting down worker.")
           e.printStackTrace(stderr)
           currentThread.interrupt()
-          idleGcScheduler.stop()
           exitProcess(1)
         }
       })
@@ -271,31 +234,30 @@ class WorkRequestHandler internal constructor(
         messageProcessor.writeWorkResponse(response)
       }
     }
-    gcScheduler.maybePerformGc()
   }
 
   /**
-   * Marks the given request as canceled and uses [.cancelCallback] to request cancellation.
+   * Marks the given request as canceled and uses [cancelCallback] to request cancellation.
    *
-   * For simplicity, and to avoid blocking in [.cancelCallback], response to cancellation
-   * is still handled by [.respondToRequest] once the canceled request aborts (or finishes).
+   * For simplicity, and to avoid blocking in [cancelCallback], response to cancellation
+   * is still handled by [respondToRequest] once the canceled request aborts (or finishes).
    */
   fun respondToCancelRequest(request: WorkRequest) {
     // Theoretically, we could have gotten two singleplex requests, and we can't tell those apart.
     // However, that's a violation of the protocol, so we don't try to handle it (not least because handling it would be quite error-prone).
-    val ri = activeRequests.get(request.requestId) ?: return
+    val requestToCancel = activeRequests.get(request.requestId) ?: return
     if (cancelCallback == null) {
-      ri.setCancelled()
+      requestToCancel.setCancelled()
       // This is either an error on the server side or a version mismatch between the server setup and the binary.
       // It's better to wait for the regular work to finish instead of breaking the build, but we should inform the user about the bad setup.
-      ri.addOutput("Cancellation request received for worker request ${request.requestId}, " +
-                     "but this worker does not support cancellation.\n")
+      requestToCancel.addOutput("Cancellation request received for worker request ${request.requestId}, " +
+                                  "but this worker does not support cancellation.\n")
     }
-    else if (ri.thread.isAlive && !ri.isCancelled()) {
-      ri.setCancelled()
+    else if (requestToCancel.thread.isAlive && !requestToCancel.isCancelled()) {
+      requestToCancel.setCancelled()
       // Response will be sent from request thread once request handler returns.
       // We can ignore any exceptions in cancel callback since it's best effort.
-      val t = Thread({ cancelCallback.accept(request.requestId, ri.thread) }, "cancel-request-${request.requestId}-callback")
+      val t = Thread({ cancelCallback(request.requestId, requestToCancel.thread) }, "cancel-request-${request.requestId}-callback")
       t.start()
     }
   }
@@ -394,13 +356,13 @@ class WorkRequestCallback(
    * The first argument to `callback` is the WorkRequest, the second is where all error messages and other user-oriented
    * messages should be written to. The callback must return an exit code indicating success (zero) or failure (nonzero).
    */
-  private val callback: BiFunction<WorkRequest, PrintWriter, Int>
+  private val callback: (WorkRequest, PrintWriter) -> Int
 ) {
   @Throws(InterruptedException::class)
   fun apply(workRequest: WorkRequest, printWriter: PrintWriter): Int {
-    val result = callback.apply(workRequest, printWriter)
+    val result = callback(workRequest, printWriter)
     if (Thread.interrupted()) {
-      throw InterruptedException("Work request interrupted: " + workRequest.requestId)
+      throw InterruptedException("Work request interrupted: ${workRequest.requestId}")
     }
     return result
   }
@@ -425,19 +387,7 @@ class WorkRequestHandlerBuilder
   private val stderr: PrintStream,
   private val messageProcessor: WorkerMessageProcessor,
 ) {
-  private var cpuUsageBeforeGc: Duration = Duration.ZERO
   private var cancelCallback: ((Int, Thread) -> Unit)? = null
-  private var idleTimeBeforeGc: Duration = Duration.ZERO
-
-  /**
-   * Sets the minimum amount of CPU time between explicit garbage collection calls.
-   * Pass `Duration.ZERO` to not do explicit garbage collection (the default).
-   */
-  @Suppress("unused")
-  fun setCpuUsageBeforeGc(cpuUsageBeforeGc: Duration): WorkRequestHandlerBuilder {
-    this.cpuUsageBeforeGc = cpuUsageBeforeGc
-    return this
-  }
 
   /**
    * Sets a callback will be called when a cancellation message has been received.
@@ -449,15 +399,6 @@ class WorkRequestHandlerBuilder
   }
 
   /**
-   * Sets the time without any work that should elapse before forcing a GC.
-   */
-  @Suppress("unused")
-  fun setIdleTimeBeforeGc(idleTimeBeforeGc: Duration): WorkRequestHandlerBuilder {
-    this.idleTimeBeforeGc = idleTimeBeforeGc
-    return this
-  }
-
-  /**
    * Returns a WorkRequestHandler instance with the values in this Builder.
    */
   fun build(): WorkRequestHandler {
@@ -465,119 +406,7 @@ class WorkRequestHandlerBuilder
       callback = callback,
       stderr = stderr,
       messageProcessor = messageProcessor,
-      cpuUsageBeforeGc = cpuUsageBeforeGc,
-      cancelCallback = cancelCallback,
-      idleTimeBeforeGc = idleTimeBeforeGc
     )
-  }
-}
-
-
-/**
- * Schedules GC when the worker has been idle for a while
- */
-private class IdleGcScheduler
-/**
- * Creates a new scheduler.
- *
- * @param idleTimeBeforeGc The time from the last activity until attempting GC.
- */(
-  /**
-   * Minimum duration from the end of activity until we perform an idle GC.
-   */
-  private val idleTimeBeforeGc: Duration
-) {
-  private val executor = ScheduledThreadPoolExecutor(1)
-  private var lastActivity: Instant = Instant.EPOCH
-  private var lastGc: Instant = Instant.EPOCH
-  private var futureGc: ScheduledFuture<*>? = null
-
-  @Synchronized
-  fun start() {
-    if (!idleTimeBeforeGc.isZero) {
-      futureGc = executor.schedule({ maybeDoGc() }, idleTimeBeforeGc.toMillis(), TimeUnit.MILLISECONDS)
-    }
-  }
-
-  /**
-   * Should be called whenever there is some sort of activity starting or ending. Better to call too often.
-   */
-  @Synchronized
-  fun markActivity(anythingActive: Boolean) {
-    lastActivity = Instant.now()
-    futureGc?.let {
-      it.cancel(false)
-      futureGc = null
-    }
-    if (!anythingActive) {
-      start()
-    }
-  }
-
-  fun maybeDoGc() {
-    if (lastGc.isBefore(lastActivity) && lastActivity.isBefore(Instant.now().minus(idleTimeBeforeGc))) {
-      System.gc()
-      lastGc = Instant.now()
-    }
-    else {
-      start()
-    }
-  }
-
-  @Synchronized
-  fun stop() {
-    futureGc?.let {
-      it.cancel(false)
-      futureGc = null
-    }
-    executor.shutdown()
-  }
-}
-
-
-/**
- * Class that performs GC occasionally, based on how much CPU time has passed. This strikes a
- * compromise between blindly doing GC after e.g., every request, which takes too much CPU, and not
- * doing explicit GC at all, which causes poor garbage collection in some cases.
- */
-private class CpuTimeBasedGcScheduler(
-  /**
-   * After this much CPU time has elapsed, we may force a GC run. Set to [Duration.ZERO] to
-   * disable.
-   */
-  private val cpuUsageBeforeGc: Duration
-) {
-  companion object {
-    /**
-     * Used to get the CPU time used by this process.
-     */
-    private val bean = ManagementFactory.getOperatingSystemMXBean() as OperatingSystemMXBean
-  }
-
-  /**
-   * The total process CPU time at the last GC run (or from the start of the worker).
-   */
-  private val cpuTimeAtLastGc = AtomicReference(cpuTime)
-
-  val cpuTime: Duration
-    get() = if (cpuUsageBeforeGc.isZero) Duration.ZERO else Duration.ofNanos(bean.processCpuTime)
-
-  /**
-   * Call occasionally to perform a GC if enough CPU time has been used.
-   */
-  fun maybePerformGc() {
-    if (cpuUsageBeforeGc.isZero) {
-      return
-    }
-
-    val currentCpuTime = cpuTime
-    val lastCpuTime = cpuTimeAtLastGc.get()
-    // do GC when enough CPU time has been used, but only if nobody else beat us to it
-    if (currentCpuTime.minus(lastCpuTime) > cpuUsageBeforeGc && cpuTimeAtLastGc.compareAndSet(lastCpuTime, currentCpuTime)) {
-      System.gc()
-      // avoid counting GC CPU time against CPU time before the next GC
-      cpuTimeAtLastGc.compareAndSet(currentCpuTime, this.cpuTime)
-    }
   }
 }
 
