@@ -197,10 +197,10 @@ class WorkRequestHandler internal constructor(
   // visible for tests
   internal fun respondToRequest(workerIo: WorkerIo, request: WorkRequest, requestInfo: RequestInfo) {
     var exitCode: Int
-    val sw = StringWriter()
-    PrintWriter(sw).use { pw ->
+    val stringWriter = StringWriter()
+    PrintWriter(stringWriter).use { pw ->
       try {
-        exitCode = callback.apply(request, pw)
+        exitCode = callback.execute(request, pw)
       }
       catch (_: InterruptedException) {
         exitCode = 1
@@ -220,19 +220,18 @@ class WorkRequestHandler internal constructor(
         stderr.println(e.message)
       }
     }
-    val builder = requestInfo.takeBuilder()
-    if (builder != null) {
-      builder.setRequestId(request.requestId)
-      if (requestInfo.isCancelled()) {
-        builder.setWasCancelled(true)
-      }
-      else {
-        builder.setOutput(builder.getOutput() + sw).setExitCode(exitCode)
-      }
-      val response = builder.build()
-      synchronized(this) {
-        messageProcessor.writeWorkResponse(response)
-      }
+
+    val builder = requestInfo.takeBuilder() ?: return
+    builder.setRequestId(request.requestId)
+    if (requestInfo.isCancelled()) {
+      builder.setWasCancelled(true)
+    }
+    else {
+      builder.setOutput(builder.getOutput() + stringWriter).setExitCode(exitCode)
+    }
+    val response = builder.build()
+    synchronized(this) {
+      messageProcessor.writeWorkResponse(response)
     }
   }
 
@@ -262,7 +261,6 @@ class WorkRequestHandler internal constructor(
     }
   }
 
-  @Throws(IOException::class)
   override fun close() {
     messageProcessor.close()
   }
@@ -348,7 +346,7 @@ internal class RequestInfo(
 }
 
 /**
- * A wrapper class for the callback BiFunction
+ * A wrapper class for the callback
  */
 class WorkRequestCallback(
   /**
@@ -359,7 +357,7 @@ class WorkRequestCallback(
   private val callback: (WorkRequest, PrintWriter) -> Int
 ) {
   @Throws(InterruptedException::class)
-  fun apply(workRequest: WorkRequest, printWriter: PrintWriter): Int {
+  fun execute(workRequest: WorkRequest, printWriter: PrintWriter): Int {
     val result = callback(workRequest, printWriter)
     if (Thread.interrupted()) {
       throw InterruptedException("Work request interrupted: ${workRequest.requestId}")
