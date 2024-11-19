@@ -6,15 +6,38 @@ module(
 bazel_dep(name = "bazel_worker_api", version = "0.0.2")
 bazel_dep(name = "rules_java", version = "7.12.2")
 bazel_dep(name = "rules_kotlin", version = "2.0.0-jb.5")
+bazel_dep(name = "rules_graalvm", version = "0.11.3")
+
 # https://github.com/bazelbuild/bazel/issues/6681#issuecomment-2188972754
 bazel_dep(name = "contrib_rules_jvm", version = "0.27.0")
 
+# GraalVM
+git_override(
+    module_name = "rules_graalvm",
+    remote = "https://github.com/sgammon/rules_graalvm",
+    commit = "cc62783c4cf6013073b702c5eb363b29bf2edbc8",
+)
+graalvm = use_extension("@rules_graalvm//:extensions.bzl", "graalvm")
+
+graalvm.graalvm(
+    name = "graalvm",
+    distribution = "oracle",
+    java_version = "23",
+    version = "23.0.0",
+)
+
+use_repo(graalvm, "graalvm")
+register_toolchains("@graalvm//:jvm")
+register_toolchains("@graalvm//:sdk")
+
+# Kotlin Rules
 archive_override(
     module_name = "rules_kotlin",
     urls = ["https://github.com/develar/rules_kotlin/releases/download/v2.0.0-jb.5/rules_kotlin-v2.0.0-jb.5.tar.gz"],
     integrity = "sha256-yz4Vx2iAisZxz/uHFtu6jbMFcaLgnheDBOTakG39GdE=",
 )
 
+# Libraries
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 
@@ -67,6 +90,6 @@ http_jar(
 )
 
 http_jar(
- name = "opentest4j",
- url = "https://repo1.maven.org/maven2/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar"
+    name = "opentest4j",
+    url = "https://repo1.maven.org/maven2/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar",
 )

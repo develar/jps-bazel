@@ -1,4 +1,5 @@
 load("@contrib_rules_jvm//docs:stardoc-input.bzl", "java_junit5_test")
+load("@rules_graalvm//graalvm:defs.bzl", "native_image")
 load("@rules_java//java:java_library.bzl", "java_library")
 load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary", "kt_jvm_import", "kt_jvm_library")
 
@@ -17,15 +18,21 @@ kt_jvm_import(
     jar = "@protobuf-java-util-file//file",
 )
 
-kt_jvm_binary(
+kt_jvm_library(
     name = "worker",
     srcs = glob(["src/*.kt"]),
-    main_class = "org.jetbrains.jps.bazel.JpsBazelBuilder",
     deps = [
         "//:worker_protocol_java_proto",
         ":protobuf-java",
         ":protobuf-java-util",
     ],
+)
+
+native_image(
+    name = "worker-native",
+    deps = [":worker"],
+    main_class = "org.jetbrains.jps.bazel.JpsBazelBuilder",
+    native_image_tool = "@graalvm//:native-image",
 )
 
 kt_jvm_library(
