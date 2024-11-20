@@ -16,3 +16,6 @@ common --experimental_ui_max_stdouterr_bytes=-1
 # disable deprecated WORKSPACE support
 # common --noenable_workspace
 test --test_verbose_timeout_warnings --test_timeout=60 --test_output=all
+
+# https://www.buildbuddy.io/blog/debugging-slow-bazel-builds/
+common --nolegacy_important_outputs --remote_build_event_upload=minimal --experimental_remote_cache_async --remote_cache_compression

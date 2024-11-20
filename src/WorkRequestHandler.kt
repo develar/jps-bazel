@@ -45,13 +45,16 @@ class WorkRequestHandler internal constructor(
    * This worker's stderr.
    */
   private val errorStream: PrintStream = System.err,
-  private val messageProcessor: WorkerMessageProcessor = ProtoWorkerMessageProcessor(stdin = System.`in`, stdout = System.out),
+  private val messageProcessor: WorkerMessageProcessor = ProtoWorkerMessageProcessor(input = System.`in`, output = System.out),
+  /**
+   * Must be quick and safe - executed in a read thread
+   */
   private val cancelHandler: ((Int) -> Unit)? = null,
 ) : AutoCloseable {
   /**
    * Requests that are currently being processed. Visible for testing.
    */
-  internal val activeRequests = ConcurrentHashMap<Int, RequestInfo>()
+  internal val activeRequests = ConcurrentHashMap<Int, AtomicReference<Thread>>()
 
   private val threadPool = Executors.newVirtualThreadPerTaskExecutor()
 
@@ -64,7 +67,7 @@ class WorkRequestHandler internal constructor(
    * or reading from [System.in], which would corrupt the worker protocol.
    * When the while loop exits, the original system streams will be swapped back into [System].
    */
-  fun processRequests() {
+  fun processRequests(isStopRequested: () -> Boolean = { false }) {
     // wrap the system streams into a WorkerIO instance to prevent unexpected reads and writes on stdin/stdout
     val workerIo = wrapStandardSystemStreams()
     try {
@@ -72,7 +75,7 @@ class WorkRequestHandler internal constructor(
       val readThread = Thread.ofVirtual().start {
         try {
           val readThread = Thread.currentThread()
-          while (!threadPool.isShutdown) {
+          while (!threadPool.isShutdown && !isStopRequested()) {
             val request = messageProcessor.readWorkRequest() ?: break
             @Suppress("UsePropertyAccessSyntax")
             if (request.getCancel()) {
@@ -123,25 +126,43 @@ class WorkRequestHandler internal constructor(
       }
     }
 
-    val requestInfo = RequestInfo()
-    val previous = activeRequests.putIfAbsent(request.requestId, requestInfo)
+    val requestStateRef = AtomicReference(NOT_STARTED)
+    val previous = activeRequests.putIfAbsent(request.requestId, requestStateRef)
     require(previous == null) {
       "Request still active: ${request.requestId}"
     }
     threadPool.execute {
       try {
-        if (requestInfo.startIfNotYet(Thread.currentThread())) {
-          handleRequest(workerIo = workerIo, request = request, requestInfo = requestInfo)
+        if (requestStateRef.compareAndSet(NOT_STARTED, Thread.currentThread())) {
+          handleRequest(workerIo = workerIo, request = request, requestState = requestStateRef)
+        }
+        else if (requestStateRef.compareAndSet(CANCELLED, FINISHED)) {
+          val response = WorkResponse.newBuilder()
+            .setRequestId(request.requestId)
+            .setWasCancelled(true)
+            .build()
+          synchronized(this) {
+            messageProcessor.writeWorkResponse(response)
+          }
+        }
+        else {
+          val state = requestStateRef.get()
+          if (state == FINISHED) {
+            return@execute
+          }
+          else {
+            throw IllegalStateException("Already started (state=$state)")
+          }
         }
       }
       catch (e: RuntimeException) {
         e.printStackTrace(errorStream)
       }
       catch (_: InterruptedException) {
-        requestInfo.markCanceled()
+        requestStateRef.markCanceled()
       }
       catch (e: Throwable) {
-        requestInfo.markCanceled()
+        requestStateRef.markCanceled()
         try {
           // shutdown the worker in case of severe issues,
           // we don't handle RuntimeException here, as those are not serious enough to merit shutting down the worker.
@@ -167,7 +188,7 @@ class WorkRequestHandler internal constructor(
    * @throws IOException if there is an error talking to the server. Errors from calling the [][.callback] are reported with exit code 1.
    */
   // visible for tests
-  internal fun handleRequest(workerIo: WorkerIo, request: WorkRequest, requestInfo: RequestInfo) {
+  internal fun handleRequest(workerIo: WorkerIo, request: WorkRequest, requestState: AtomicReference<Thread>) {
     var exitCode = 1
     val stringWriter = StringWriter()
     stringWriter.use { writer ->
@@ -175,7 +196,7 @@ class WorkRequestHandler internal constructor(
         exitCode = executor(request, writer)
       }
       catch (_: InterruptedException) {
-        requestInfo.markCanceled()
+        requestState.markCanceled()
       }
       catch (e: Error) {
         throw e
@@ -198,7 +219,7 @@ class WorkRequestHandler internal constructor(
 
     val responseBuilder = WorkResponse.newBuilder()
     responseBuilder.setRequestId(request.requestId)
-    if (requestInfo.isCancelled()) {
+    if (requestState.getAndSet(FINISHED) == CANCELLED) {
       responseBuilder.setWasCancelled(true)
     }
     else {
@@ -220,13 +241,12 @@ class WorkRequestHandler internal constructor(
     // Theoretically, we could have gotten two singleplex requests, and we can't tell those apart.
     // However, that's a violation of the protocol, so we don't try to handle it (not least because handling it would be quite error-prone).
     val requestToCancel = activeRequests.get(request.requestId) ?: return
-    if (requestToCancel.markCanceled()) {
+    val currentState = requestToCancel.get()
+    if (currentState != FINISHED && requestToCancel.compareAndSet(currentState, CANCELLED)) {
       // Response will be sent from request thread once request handler returns.
       // We can ignore any exceptions in cancel callback since it's best effort.
       if (cancelHandler != null) {
-        threadPool.execute {
-          cancelHandler(request.requestId)
-        }
+        cancelHandler(request.requestId)
       }
     }
   }
@@ -259,41 +279,15 @@ interface WorkerMessageProcessor {
   fun close()
 }
 
-@JvmInline
-internal value class RequestThreadInfo(private val obj: Any?) {
-  companion object {
-    val CANCELLED = RequestThreadInfo("cancelled")
-    val NOT_STARTED = RequestThreadInfo("not_started")
-  }
-
-  fun get(): Thread? = obj as? Thread
-}
+private val NOT_STARTED = Thread.ofVirtual().name("not_started").unstarted { }
+private val CANCELLED = Thread.ofVirtual().name("cancelled").unstarted { }
+private val FINISHED = Thread.ofVirtual().name("finished").unstarted { }
 
 /**
- * Holds information necessary to properly handle a request, especially for cancellation.
+ * Returns whether this request was active.
  */
-@JvmInline
-internal value class RequestInfo(val thread: AtomicReference<RequestThreadInfo> = AtomicReference(RequestThreadInfo.NOT_STARTED)) {
-  fun startIfNotYet(newThread: Thread): Boolean {
-    val prevState = thread.getAndSet(RequestThreadInfo(newThread))
-    val prevThread = prevState.get()
-    require(prevThread == null) {
-      "Already started (prevThread=$prevThread)"
-    }
-    return prevState == RequestThreadInfo.NOT_STARTED
-  }
-
-  /**
-   * Returns whether this request was active.
-   */
-  fun markCanceled(): Boolean {
-    return thread.getAndSet(RequestThreadInfo.CANCELLED).get() != null
-  }
-
-  /**
-   * Returns true if this request has been canceled.
-   */
-  fun isCancelled(): Boolean = thread.get() == RequestThreadInfo.CANCELLED
+private fun AtomicReference<Thread>.markCanceled(): Boolean {
+  return getAndSet(CANCELLED).isAlive
 }
 
 /**

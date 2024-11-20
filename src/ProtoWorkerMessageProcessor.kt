@@ -6,17 +6,17 @@ import java.io.InputStream
 import java.io.OutputStream
 
 class ProtoWorkerMessageProcessor(
-  private val stdin: InputStream,
-  private val stdout: OutputStream
+  private val input: InputStream,
+  private val output: OutputStream
 ) : WorkerMessageProcessor {
-  override fun readWorkRequest(): WorkRequest? = WorkRequest.parseDelimitedFrom(stdin)
+  override fun readWorkRequest(): WorkRequest? = WorkRequest.parseDelimitedFrom(input)
 
   override fun writeWorkResponse(workResponse: WorkResponse) {
     try {
-      workResponse.writeDelimitedTo(stdout)
+      workResponse.writeDelimitedTo(output)
     }
     finally {
-      stdout.flush()
+      output.flush()
     }
   }
 
