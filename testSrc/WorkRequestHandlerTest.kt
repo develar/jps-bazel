@@ -87,7 +87,7 @@ class WorkRequestHandlerTest {
     assertThat(response.getOutput()).isEmpty()
   }
 
-  ////@Test
+  @Test
   fun multiplexWorkRequestStopsThreadsOnShutdown() {
     val src = PipedOutputStream()
     val dest = PipedInputStream()
